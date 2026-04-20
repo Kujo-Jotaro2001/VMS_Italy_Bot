@@ -1,16 +1,14 @@
 """
-VMS Italy — монитор свободных слотов на подачу документов.
+VMS Italy — монитор свободных слотов по прямой ссылке с токеном.
 
 Поток:
-  1. Открыть форму «Информация о записи» напрямую
-  2. Ввести номер записи + паспорта (посимвольно — поле с jquery-маской)
-  3. Кликнуть капчу:
-       - если прошла сразу (только чекбокс) — хорошо
-       - если появился image challenge — решаем YOLOv8
-  4. Нажать «Далее», перейти на «Назначить другую дату»
-  5. На странице переноса кликать капчу каждые ~55 сек
-  6. Если слот найден — нажать кнопку переноса + уведомить Telegram
-  7. При истечении сессии — перелогиниться автоматически
+  1. Открыть TARGET_URL (прямая ссылка с ?t=<token>)
+  2. Решить reCAPTCHA (аудио-режим через Whisper)
+  3. После решения страница сама перезагружается — показывает слоты
+  4. Проверять каждые ~5 сек:
+       - если галка капчи слетела — решать заново
+       - если слоты появились (исчез текст NO_SLOTS_TEXT) — нажать «Далее» + TG
+  5. При сбое — перезагрузить TARGET_URL и начать сначала
 """
 
 import asyncio
@@ -49,11 +47,10 @@ async def _bezier_move(page: Page, tx: float, ty: float) -> None:
     c2y = sy + dy * 0.66 + ny * offset2
 
     steps = max(int(dist / random.uniform(6, 12)), 8)
-    steps = min(steps, 60)
+    steps = min(steps, 30)
 
     for i in range(1, steps + 1):
         t = i / steps
-        # Ease-in-out — медленный старт/финиш
         t = t * t * (3 - 2 * t)
         mt = 1 - t
         x = mt**3 * sx + 3*mt**2*t*c1x + 3*mt*t**2*c2x + t**3 * tx
@@ -63,20 +60,24 @@ async def _bezier_move(page: Page, tx: float, ty: float) -> None:
         except Exception:
             return
         _mouse_pos["x"], _mouse_pos["y"] = x, y
-        # Джиттер времени — человек не двигает мышь с постоянной скоростью
-        await asyncio.sleep(random.uniform(0.005, 0.018))
+    # Один sleep в конце вместо 30-60 микро-sleep на каждый шаг
+    await asyncio.sleep(random.uniform(0.1, 0.3))
 
 
-async def human_delay(lo: float = 0.4, hi: float = 1.4) -> None:
-    await asyncio.sleep(random.uniform(lo, hi))
-
-
-async def human_mouse_move(page: Page) -> None:
-    """Случайное движение мыши по странице (через Безье)."""
+async def human_mouse_move(page: Page, fast: bool = False) -> None:
+    """Случайное движение мыши по странице."""
     w, h = 1280, 800
     tx = random.uniform(50, w - 50)
     ty = random.uniform(50, h - 50)
-    await _bezier_move(page, tx, ty)
+    if fast:
+        # Во время мониторинга — один быстрый move без Безье-цикла
+        try:
+            await page.mouse.move(tx, ty, steps=5)
+        except Exception:
+            pass
+        _mouse_pos["x"], _mouse_pos["y"] = tx, ty
+    else:
+        await _bezier_move(page, tx, ty)
 
 
 async def human_scroll(page: Page) -> None:
@@ -109,12 +110,19 @@ async def human_click(page: Page, element) -> None:
             pass
 
 import bot_state
+import vpn_rotator
 from captcha_solver import solve_image_challenge
 from audio_solver import solve_audio_challenge, is_captcha_blocked
 from config import (
-    BOOKING_NUMBER, PASSPORT_NUMBER,
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-    SITE_URL, NO_SLOTS_TEXT, HEADLESS,
+    TARGET_URL, HEADLESS,
+)
+
+# Поддержка нескольких получателей: строка или список строк
+_CHAT_IDS: list[str] = (
+    [str(c) for c in TELEGRAM_CHAT_ID]
+    if isinstance(TELEGRAM_CHAT_ID, (list, tuple))
+    else [str(TELEGRAM_CHAT_ID)]
 )
 
 logging.basicConfig(
@@ -124,25 +132,24 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-INFO_URL = "https://italyvms.com/autoform/info.htm?lang=ru"
-
 # ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
 
 async def tg(text: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(url, json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-                "parse_mode": "HTML",
-            })
-            if r.status_code != 200:
-                log.warning("Telegram ответил %s: %s", r.status_code, r.text[:200])
-    except Exception as e:
-        log.warning("Не смог отправить в Telegram: %s", e)
+    async with httpx.AsyncClient(timeout=10, verify=False) as client:
+        for chat_id in _CHAT_IDS:
+            try:
+                r = await client.post(url, json={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                })
+                if r.status_code != 200:
+                    log.warning("Telegram [%s] ответил %s: %s", chat_id, r.status_code, r.text[:200])
+            except Exception as e:
+                log.warning("Не смог отправить в Telegram [%s]: %s: %s", chat_id, type(e).__name__, e)
 
 def ts() -> str:
     return datetime.now().strftime("%d.%m %H:%M:%S")
@@ -152,20 +159,25 @@ def _tg_send_sync(text: str) -> None:
     """Синхронная отправка в Telegram через urllib (без httpx/asyncio)."""
     import urllib.request
     import json as _json
+    import ssl as _ssl
+    _ctx = _ssl.create_default_context()
+    _ctx.check_hostname = False
+    _ctx.verify_mode = _ssl.CERT_NONE
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    body = _json.dumps({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            r.read()
-    except Exception as e:
-        log.warning("TG send: %s: %s", type(e).__name__, e)
+    for chat_id in _CHAT_IDS:
+        body = _json.dumps({
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15, context=_ctx) as r:
+                r.read()
+        except Exception as e:
+            log.warning("TG send [%s]: %s: %s", chat_id, type(e).__name__, e)
 
 
 def telegram_command_listener_sync() -> None:
@@ -178,6 +190,11 @@ def telegram_command_listener_sync() -> None:
     import urllib.parse
     import json as _json
     import time as _time
+    import ssl as _ssl
+
+    _ctx = _ssl.create_default_context()
+    _ctx.check_hostname = False
+    _ctx.verify_mode = _ssl.CERT_NONE
 
     base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
     offset = None
@@ -186,16 +203,16 @@ def telegram_command_listener_sync() -> None:
 
     while True:
         try:
-            params = {"timeout": "10"}
+            params = {"timeout": "5"}  # короткий long-poll → быстро реагируем на смену VPN
             if offset is not None:
                 params["offset"] = str(offset)
             url = f"{base_url}/getUpdates?{urllib.parse.urlencode(params)}"
-            # socket timeout должен быть > long-poll timeout
-            with urllib.request.urlopen(url, timeout=20) as r:
+            # socket timeout чуть больше long-poll timeout
+            with urllib.request.urlopen(url, timeout=8, context=_ctx) as r:
                 data = _json.loads(r.read())
             if not data.get("ok"):
                 log.warning("TG getUpdates not ok: %s", data)
-                _time.sleep(5)
+                _time.sleep(3)
                 continue
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
@@ -205,9 +222,9 @@ def telegram_command_listener_sync() -> None:
                     continue  # старое — игнорируем
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 text = (msg.get("text") or "").strip().lower()
-                log.info("TG upd: chat_id=%s text=%r (ожидаю %s)", chat_id, text, TELEGRAM_CHAT_ID)
-                if chat_id != str(TELEGRAM_CHAT_ID):
-                    log.warning("TG: chat_id %s не совпадает с %s — игнорирую", chat_id, TELEGRAM_CHAT_ID)
+                log.info("TG upd: chat_id=%s text=%r", chat_id, text)
+                if chat_id not in _CHAT_IDS:
+                    log.warning("TG: chat_id %s не в списке — игнорирую", chat_id)
                     continue
                 log.info("TG команда принята: %s", text)
                 if text in ("/status", "/stats", "status"):
@@ -219,29 +236,8 @@ def telegram_command_listener_sync() -> None:
             if "timed out" in err or "timeout" in err:
                 log.debug("TG listener: idle timeout — переподключаюсь")
             else:
-                log.warning("TG listener: %s: %s — жду 5с", type(e).__name__, e)
-                _time.sleep(5)
-
-# ---------------------------------------------------------------------------
-# Заполнение поля с маской (jquery.maskedinput)
-# ---------------------------------------------------------------------------
-
-async def type_masked(page: Page, selector: str, value: str) -> None:
-    field = page.locator(selector)
-    await human_click(page, field)
-    await human_delay(0.5, 1.2)
-    await field.press("Control+a")
-    await asyncio.sleep(random.uniform(0.1, 0.25))
-    await field.press("Delete")
-    await asyncio.sleep(random.uniform(0.3, 0.7))
-    # Печатаем посимвольно с человеческим ритмом
-    for ch in value:
-        await field.press(ch)
-        # Основная задержка: 120-280ms (человек печатает ~4-5 симв/сек)
-        await asyncio.sleep(random.uniform(0.12, 0.28))
-        # 10% шанс "задуматься" на 0.4-1.2с
-        if random.random() < 0.10:
-            await asyncio.sleep(random.uniform(0.4, 1.2))
+                log.debug("TG listener: %s: %s — жду 3с", type(e).__name__, e)
+                _time.sleep(3)
 
 # ---------------------------------------------------------------------------
 # Капча
@@ -250,7 +246,7 @@ async def type_masked(page: Page, selector: str, value: str) -> None:
 async def captcha_is_checked(page: Page) -> bool:
     try:
         frame = page.frame_locator('iframe[title*="reCAPTCHA"]').first
-        aria = await frame.locator("#recaptcha-anchor").get_attribute("aria-checked", timeout=3_000)
+        aria = await frame.locator("#recaptcha-anchor").get_attribute("aria-checked", timeout=1_000)
         return aria == "true"
     except Exception:
         return False
@@ -267,22 +263,22 @@ async def solve_captcha(page: Page, context: str = "") -> bool:
     """
     1. Кликает чекбокс
     2. Если прошло — возвращает True
-    3. Если появился image challenge — решает через YOLOv8
+    3. Если появился bframe (любой challenge) — вызывает solve_audio_challenge
+       (который сам переключится на аудио через #recaptcha-audio-button)
     """
     label = f" ({context})" if context else ""
 
-    # Клик по чекбоксу — через iframe координаты (mouse.move внутрь frame не умеет,
-    # но случайные движения + задержки перед кликом всё равно помогают)
     try:
+        # Одно движение мыши — «заметил капчу»
         await human_mouse_move(page)
-        await human_delay(0.8, 2.2)
+        await human_delay(0.5, 1.2)
         frame = page.frame_locator('iframe[title*="reCAPTCHA"]').first
         checkbox = frame.locator("#recaptcha-anchor")
         await checkbox.wait_for(state="visible", timeout=8_000)
-        await human_delay(0.4, 1.1)
-        await checkbox.click()
+        await human_delay(0.4, 1.0)
+        await human_click(page, checkbox)
         log.info("Кликнул капчу%s", label)
-        await asyncio.sleep(random.uniform(2.8, 4.2))
+        await asyncio.sleep(random.uniform(1.2, 2.5))
     except Exception as e:
         log.warning("Не смог кликнуть капчу%s: %s", label, e)
         return False
@@ -292,135 +288,302 @@ async def solve_captcha(page: Page, context: str = "") -> bool:
         log.info("Капча прошла автоматически ✅")
         return True
 
-    # Challenge → только аудио, без YOLO-fallback
-    if await image_challenge_present(page):
-        log.info("Challenge появился — пробую аудио-режим (Whisper)…")
-        ok = await solve_audio_challenge(page)
-        if ok:
-            return True
-        log.warning("Аудио не сработало — вернём False, вызывающий код перезагрузит страницу")
-        return False
-
-    log.warning("Капча не прошла и challenge не обнаружен%s", label)
-    return False
-
-# ---------------------------------------------------------------------------
-# Авторизация
-# ---------------------------------------------------------------------------
-
-async def login(page: Page, max_attempts: int = 4) -> bool:
-    for attempt in range(1, max_attempts + 1):
-        log.info("Открываю форму входа (попытка %d/%d)…", attempt, max_attempts)
-        await page.goto(INFO_URL, wait_until="domcontentloaded")
-
-        # 1. Долгий dwell — человек читает заголовок/инструкции ~4-8с
-        await human_delay(4.0, 8.0)
-        await human_mouse_move(page)
-        await human_scroll(page)
-        await human_delay(1.5, 3.5)
-
-        try:
-            # 2. Заполняем appnum
-            await type_masked(page, "input[name='appnum']", BOOKING_NUMBER)
-            # 3. «Проверяем» что набрали — пауза + движение мыши куда-то в сторону
-            await human_delay(1.2, 2.8)
-            await human_mouse_move(page)
-            await human_delay(0.8, 2.0)
-            # 4. Заполняем passnum
-            await type_masked(page, "input[name='passnum']", PASSPORT_NUMBER)
-            # 5. «Читаем заполненное» + лёгкий скролл
-            await human_delay(1.5, 3.2)
-            await human_scroll(page)
-            await human_delay(1.0, 2.5)
-            log.info("Форма заполнена")
-        except Exception as e:
-            log.error("Не смог заполнить форму: %s", e)
-            return False
-
-        if not await captcha_is_checked(page):
-            ok = await solve_captcha(page, "форма входа")
-            if not ok:
-                # Если Google выкинул предупреждение — reload и перезаход
-                if await is_captcha_blocked(page) and attempt < max_attempts:
-                    bot_state.on_blocked()
-                    cooldown = random.uniform(8.0, 15.0)
-                    log.warning(
-                        "Блокировка «Повторите попытку позже» — жду %.1fс и перезагружаю",
-                        cooldown,
-                    )
-                    await asyncio.sleep(cooldown)
-                    continue
-                log.error("Капча не решена")
-                return False
-
-        try:
-            # 6. Пауза перед «Далее» — человек смотрит на форму прежде чем отправить
-            await human_delay(1.5, 3.5)
-            submit_btn = page.locator("input[type='submit']").first
-            await human_click(page, submit_btn)
-        except Exception as e:
-            log.error("Не смог нажать «Далее»: %s", e)
-            return False
-
-        await asyncio.sleep(random.uniform(2.5, 4.0))
-        break
-
-    if await page.locator("text=Номер записи").is_visible(timeout=6_000):
-        log.info("Вошли успешно ✅")
-        return True
-
-    log.error("После входа оказались не там: %s", page.url)
-    return False
-
-# ---------------------------------------------------------------------------
-# Переход на страницу переноса
-# ---------------------------------------------------------------------------
-
-async def go_to_reschedule(page: Page) -> bool:
+    # Ждём появления bframe (любой challenge — image или audio)
+    challenge = page.frame_locator('iframe[src*="bframe"]')
+    bframe_visible = False
     try:
-        await human_delay(1.2, 2.8)
-        await human_mouse_move(page)
-        await human_delay(0.5, 1.4)
-        link = page.locator("text=Назначить другую дату").first
-        await link.wait_for(state="visible", timeout=8_000)
-        await human_click(page, link)
-        await asyncio.sleep(random.uniform(2.0, 3.5))
-        log.info("Открыта страница переноса даты")
-        return True
-    except Exception as e:
-        log.error("Не нашёл кнопку переноса: %s", e)
+        await challenge.locator("body").wait_for(state="visible", timeout=5_000)
+        bframe_visible = True
+    except Exception:
+        pass
+
+    if not bframe_visible:
+        # Перепроверим галку — могла проставиться пока ждали
+        if await captcha_is_checked(page):
+            log.info("Капча прошла (повторная проверка) ✅")
+            return True
+        log.warning("Капча не прошла и bframe не появился%s", label)
         return False
+
+    # Challenge есть → аудио-режим (solve_audio_challenge сам жмёт наушники)
+    log.info("Challenge появился — пробую аудио-режим (Whisper)…")
+    ok = await solve_audio_challenge(page)
+    if ok:
+        return True
+    log.warning("Аудио не сработало — вернём False, вызывающий код перезагрузит страницу")
+    return False
+
+# ---------------------------------------------------------------------------
+# Открытие целевой страницы
+# ---------------------------------------------------------------------------
+
+async def open_target(page: Page) -> None:
+    log.info("Открываю TARGET_URL…")
+    await page.goto(TARGET_URL, wait_until="domcontentloaded")
+    await human_delay(1.5, 3.0)
+    await human_mouse_move(page)
 
 # ---------------------------------------------------------------------------
 # Проверка наличия слотов
 # ---------------------------------------------------------------------------
 
+RATE_LIMIT_TEXT = "Слишком много запросов"
+
 async def slots_available(page: Page) -> bool:
-    content = await page.content()
-    return NO_SLOTS_TEXT.lower() not in content.lower()
+    """
+    Слот есть только если в #first_date стоит реальная дата dd.mm.yyyy.
+    Rate-limit и NO_SLOTS_TEXT — оба означают «слота нет».
+    """
+    text = await page.evaluate("""
+        () => {
+            const el = document.querySelector('#first_date');
+            return el ? (el.innerText || el.textContent || '').trim() : '';
+        }
+    """)
+    import re
+    if re.search(r'\d{2}\.\d{2}\.\d{4}', text):
+        return True
+    if RATE_LIMIT_TEXT in text:
+        log.debug("Rate-limit от сервера, ждём следующей проверки")
+    return False
 
-# ---------------------------------------------------------------------------
-# Нажать кнопку подтверждения переноса
-# ---------------------------------------------------------------------------
 
-async def confirm_reschedule(page: Page) -> bool:
+async def is_rate_limited(page: Page) -> bool:
     try:
-        await human_delay(0.6, 1.5)
-        btn = page.locator("input[type='submit'], button:has-text('Назначить')").first
-        await btn.wait_for(state="visible", timeout=5_000)
-        await human_click(page, btn)
-        log.info("Нажал кнопку подтверждения переноса")
+        text = await page.evaluate("""
+            () => {
+                const el = document.querySelector('#first_date');
+                return el ? (el.innerText || el.textContent || '').trim() : '';
+            }
+        """)
+        if RATE_LIMIT_TEXT in text:
+            return True
+    except Exception:
+        pass
+    try:
+        body_txt = await page.locator("body").inner_text(timeout=1_500)
+        if RATE_LIMIT_TEXT in body_txt:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def rotate_vpn_and_reload(page: Page, reason: str) -> None:
+    """
+    Переключает VPN на следующий WG-конфиг и перезагружает TARGET_URL.
+    """
+    log.info("🔀 Ротация VPN: %s", reason)
+    loop = asyncio.get_running_loop()
+    new_name = await loop.run_in_executor(None, vpn_rotator.rotate)
+    if new_name:
+        log.info("VPN → %s", new_name)
+        bot_state.on_vpn_rotated(new_name)
+    else:
+        log.warning("Не удалось переключить VPN")
+    await asyncio.sleep(3.0)
+    try:
+        await page.goto(TARGET_URL, wait_until="domcontentloaded")
+    except Exception as e:
+        log.warning("goto после ротации VPN: %s", e)
+    await human_delay(2.0, 3.5)
+
+# ---------------------------------------------------------------------------
+# Нажать кнопку «Далее» (когда слоты появились)
+# ---------------------------------------------------------------------------
+
+async def _debug_snapshot(page: Page, tag: str) -> None:
+    """Сохранить HTML + скриншот для разбора структуры при успехе."""
+    import os
+    from datetime import datetime
+    try:
+        ts_tag = datetime.now().strftime("%H%M%S")
+        dbg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captcha_debug")
+        os.makedirs(dbg_dir, exist_ok=True)
+        html_path = os.path.join(dbg_dir, f"{ts_tag}_{tag}.html")
+        png_path = os.path.join(dbg_dir, f"{ts_tag}_{tag}.png")
+        html = await page.content()
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        try:
+            await page.screenshot(path=png_path, full_page=True)
+        except Exception:
+            pass
+        log.info("Сохранил debug: %s, %s", html_path, png_path)
+    except Exception as e:
+        log.warning("Не смог сохранить debug snapshot: %s", e)
+
+
+async def _pick_nearest_date(page: Page) -> str | None:
+    """
+    Читает дату из #first_date (формат dd.mm.yyyy).
+    Возвращает None если там rate-limit или пусто — тогда будет fallback
+    на первый доступный день в датепикере.
+    """
+    try:
+        text = await page.evaluate("""
+            () => {
+                const root = document.querySelector('#first_date');
+                return root ? (root.innerText || root.textContent || '').trim() : '';
+            }
+        """)
+        import re
+        m = re.search(r'(\d{2}\.\d{2}\.\d{4})', text)
+        if m:
+            return m.group(1)
+        log.info("#first_date: '%s' — дата не найдена, используем fallback", text[:60])
+    except Exception as e:
+        log.warning("Ошибка при чтении #first_date: %s", e)
+    return None
+
+
+async def _select_date_and_time(page: Page) -> bool:
+    """
+    1. Кликает на поле #app_date — открывается jQuery UI datepicker
+    2. Ждёт появления календаря, кликает первый доступный день
+       (td без ui-state-disabled, с a.ui-state-default внутри)
+    3. Ждёт появления опций в #timeslot и выбирает первую непустую
+    """
+    date_str = await _pick_nearest_date(page)
+    if not date_str:
+        log.warning("Дата в #first_date не найдена — не могу выбрать слот автоматически")
+        return False
+
+    log.info("Ближайшая доступная дата: %s", date_str)
+
+    # Шаг 1: открываем календарь кликом на поле
+    try:
+        await page.locator("#app_date").wait_for(state="visible", timeout=5_000)
+        await page.click("#app_date")
+        await page.wait_for_function(
+            "() => { const d = document.querySelector('#ui-datepicker-div'); "
+            "return d && d.style.display !== 'none'; }",
+            timeout=3_000,
+        )
+    except Exception as e:
+        log.warning("Не смог открыть календарь: %s", e)
+        return False
+
+    # Шаг 2: листаем до нужного месяца и кликаем день
+    try:
+        if date_str:
+            # Знаем точную дату — листаем до нужного месяца и кликаем конкретный день
+            parts = date_str.split(".")
+            target_day   = int(parts[0])
+            target_month = int(parts[1])
+            target_year  = int(parts[2])
+            clicked = await page.evaluate(
+                """([day, month, year]) => {
+                    const $inp = $('#app_date');
+                    for (let i = 0; i < 18; i++) {
+                        const inst = $.datepicker._getInst($inp[0]);
+                        if (inst.drawMonth + 1 === month && inst.drawYear === year) break;
+                        $.datepicker._adjustDate($inp[0], +1, 'M');
+                    }
+                    const links = document.querySelectorAll(
+                        '#ui-datepicker-div td:not(.ui-state-disabled) a.ui-state-default'
+                    );
+                    for (const a of links) {
+                        if (a.textContent.trim() === String(day)) { a.click(); return true; }
+                    }
+                    return false;
+                }""",
+                [target_day, target_month, target_year],
+            )
+            if clicked:
+                log.info("Выбрал дату %s в календаре", date_str)
+            else:
+                log.warning("День %s не найден — кликаю первый доступный", target_day)
+                clicked = await page.evaluate("""
+                    () => {
+                        const a = document.querySelector(
+                            '#ui-datepicker-div td:not(.ui-state-disabled) a.ui-state-default'
+                        );
+                        if (a) { a.click(); return a.textContent.trim(); }
+                        return null;
+                    }
+                """)
+                log.info("Кликнул первый доступный день: %s", clicked)
+        else:
+            # #first_date недоступен (rate-limit) — кликаем первый доступный день
+            clicked = await page.evaluate("""
+                () => {
+                    const a = document.querySelector(
+                        '#ui-datepicker-div td:not(.ui-state-disabled) a.ui-state-default'
+                    );
+                    if (a) { a.click(); return a.textContent.trim(); }
+                    return null;
+                }
+            """)
+            if not clicked:
+                log.warning("Нет доступных дней в календаре")
+                return False
+            log.info("Кликнул первый доступный день: %s (дата из first_date недоступна)", clicked)
+    except Exception as e:
+        log.warning("Ошибка при выборе даты в календаре: %s", e)
+        return False
+
+    # Шаг 3: ждём пока AJAX заполнит #timeslot
+    try:
+        await page.wait_for_function(
+            """() => {
+                const sel = document.querySelector('#timeslot');
+                if (!sel || sel.style.display === 'none') return false;
+                return Array.from(sel.options).some(o => o.value && o.value !== '0');
+            }""",
+            timeout=12_000,
+        )
+    except Exception:
+        log.warning("Таймслоты не появились за 12с")
+        return False
+
+    # Шаг 4: выбираем первую непустую опцию времени
+    try:
+        picked = await page.evaluate(
+            """() => {
+                const sel = document.querySelector('#timeslot');
+                const opt = Array.from(sel.options).find(o => o.value && o.value !== '0');
+                if (!opt) return null;
+                sel.value = opt.value;
+                $(sel).trigger('change');
+                return opt.text.trim();
+            }"""
+        )
+        if not picked:
+            log.warning("Нет валидных таймслотов в #timeslot")
+            return False
+        log.info("Выбрал время: %s", picked)
         return True
     except Exception as e:
-        log.warning("Не смог нажать кнопку переноса: %s", e)
+        log.warning("Не смог выбрать время: %s", e)
+        return False
+
+
+async def click_next(page: Page) -> bool:
+    try:
+        # Сохраняем снапшот структуры — на случай если селекторы не подойдут
+        await _debug_snapshot(page, "slot_found")
+
+        # Выбираем дату и время ДО нажатия кнопки
+        filled = await _select_date_and_time(page)
+        if not filled:
+            log.warning("Не удалось выбрать дату/время — пробую жать «Далее» как есть")
+
+        btn = page.locator("#next_button")
+        await btn.wait_for(state="visible", timeout=5_000)
+        await page.click("#next_button")
+        log.info("Нажал кнопку «Далее» (#next_button)")
+        return True
+    except Exception as e:
+        log.warning("Не смог нажать «Далее»: %s", e)
         return False
 
 # ---------------------------------------------------------------------------
 # Основной цикл мониторинга
 # ---------------------------------------------------------------------------
 
-SLOT_CHECK_INTERVAL = 5   # проверять слоты и галку каждые 5 секунд
-MOUSE_MOVE_INTERVAL = 20  # двигать мышь каждые ~20 секунд (чтобы не стоять мёртво)
+SLOT_CHECK_INTERVAL = 5        # проверять слоты и галку каждые 5 секунд
+VPN_ROTATE_EVERY_N_CAPTCHAS = 10  # ротация VPN каждые N решённых капчей
 
 async def monitor_loop(page: Page) -> None:
     log.info("Мониторинг запущен (проверка каждые %sс)…", SLOT_CHECK_INTERVAL)
@@ -428,34 +591,71 @@ async def monitor_loop(page: Page) -> None:
 
     # Решаем капчу сразу при входе
     if not await captcha_is_checked(page):
-        ok = await solve_captcha(page, "страница переноса")
+        ok = await solve_captcha(page, "стартовая")
         if not ok:
+            # Возможно Google заблокировал — ротируем VPN
+            if await is_captcha_blocked(page):
+                await rotate_vpn_and_reload(page, "Google заблокировал капчу на входе")
             raise RuntimeError("session_expired")
+        # После решения страница сама перезагружается — ждём
+        await asyncio.sleep(random.uniform(3.0, 5.0))
 
-    ticks_since_mouse = 0
+    # Счётчик до следующего движения мыши — нерегулярный
+    ticks_until_mouse = random.randint(3, 6)
+    # Счётчик подряд идущих rate-limit тиков — ротируем VPN если долго висит
+    rate_limit_streak = 0
+    RATE_LIMIT_THRESHOLD = 2  # ~10с подряд rate-limit → смена страны
+    # Плановая ротация VPN по количеству решённых капчей
+    last_rotate_at_captcha = bot_state.solved_count()
 
     while True:
         await asyncio.sleep(SLOT_CHECK_INTERVAL)
 
-        # Проверяем сессию
-        if SITE_URL.rstrip("/") == page.url.rstrip("/") or "info.htm" in page.url:
-            raise RuntimeError("session_expired")
+        # Плановая ротация VPN каждые N решённых капчей
+        if bot_state.solved_count() - last_rotate_at_captcha >= VPN_ROTATE_EVERY_N_CAPTCHAS:
+            await rotate_vpn_and_reload(page, f"плановая ротация (каждые {VPN_ROTATE_EVERY_N_CAPTCHAS} капчей)")
+            last_rotate_at_captcha = bot_state.solved_count()
+            rate_limit_streak = 0
+            continue
 
-        # Галка слетела → сразу решаем капчу
+        # Галка слетела → решаем капчу
         if not await captcha_is_checked(page):
             log.info("Галка слетела — решаю капчу…")
-            reschedule_url = page.url
-            ok = await solve_captcha(page, "страница переноса")
+            current_url = page.url
+            ok = await solve_captcha(page, "reload")
             if not ok:
-                log.warning("Капча не решилась — перезагружаю reschedule-страницу и пробую ещё раз…")
+                # Если Google показал «подозрительную активность» — нужен новый IP
+                if await is_captcha_blocked(page):
+                    await rotate_vpn_and_reload(page, "Google заблокировал капчу")
+                    rate_limit_streak = 0
+                    continue
+                log.warning("Капча не решилась — перезагружаю страницу и пробую ещё раз…")
                 await tg(f"⚠️ Капча не прошла — перезагружаю страницу [{ts()}]")
                 await asyncio.sleep(5)
-                await page.goto(reschedule_url, wait_until="domcontentloaded")
+                await page.goto(current_url, wait_until="domcontentloaded")
                 await asyncio.sleep(3)
-                ok2 = await solve_captcha(page, "страница переноса (после reload)")
+                ok2 = await solve_captcha(page, "после reload")
                 if not ok2:
-                    log.warning("Повторная попытка тоже провалилась — перелогиниваюсь")
+                    if await is_captcha_blocked(page):
+                        await rotate_vpn_and_reload(page, "Google блок после reload")
+                        rate_limit_streak = 0
+                        continue
+                    log.warning("Повторная попытка провалилась — перезаход на TARGET_URL")
                     raise RuntimeError("session_expired")
+            # После решения страница сама перезагружается — ждём
+            await asyncio.sleep(random.uniform(3.0, 5.0))
+
+        # Rate-limit от сайта — если долго висит, меняем IP
+        if await is_rate_limited(page):
+            rate_limit_streak += 1
+            log.info("Rate-limit тик #%d", rate_limit_streak)
+            if rate_limit_streak >= RATE_LIMIT_THRESHOLD:
+                await rotate_vpn_and_reload(page, f"rate-limit {rate_limit_streak} тиков подряд")
+                rate_limit_streak = 0
+                last_rotate_at_captcha = bot_state.solved_count()
+                continue
+        else:
+            rate_limit_streak = 0
 
         # Проверяем слоты
         has_slots = await slots_available(page)
@@ -463,42 +663,87 @@ async def monitor_loop(page: Page) -> None:
         if has_slots:
             msg = f"🎉 НАЙДЕН СВОБОДНЫЙ СЛОТ! [{ts()}]\n{page.url}"
             log.info(msg)
-            await tg(msg)
-            pressed = await confirm_reschedule(page)
-            if pressed:
-                await tg(f"✅ Нажал кнопку «Назначить другую дату» [{ts()}] — проверь сайт!")
-            else:
-                await tg(f"⚠️ Не смог нажать автоматически — зайди вручную немедленно!")
-            await asyncio.sleep(10)
+            # СНАЧАЛА бронируем — TG потом, даже если упадёт
+            pressed = False
+            try:
+                pressed = await click_next(page)
+            except Exception as e:
+                log.exception("Ошибка при бронировании: %s", e)
+            # Теперь пытаемся слать TG (не блокируем основной поток надолго)
+            try:
+                await tg(msg)
+                if pressed:
+                    await tg(
+                        f"✅ Выбрал дату/время и нажал «Далее» [{ts()}] "
+                        f"— заходи на сайт СРОЧНО и заверши запись!\n{page.url}"
+                    )
+                else:
+                    await tg(
+                        f"⚠️ Не смог нажать «Далее» автоматически [{ts()}] "
+                        f"— зайди вручную немедленно!\n{page.url}"
+                    )
+            except Exception as e:
+                log.warning("TG после бронирования упал: %s", e)
+            # Не спамим повторными нажатиями — даём 2 минуты на ручное завершение
+            log.info("Слот обработан — приостанавливаю мониторинг на 120с")
+            await asyncio.sleep(120)
         else:
             log.info("Слотов нет")
 
-        # Случайное движение мыши раз в ~20с, чтобы не выглядеть мёртво
-        ticks_since_mouse += 1
-        if ticks_since_mouse >= MOUSE_MOVE_INTERVAL // SLOT_CHECK_INTERVAL:
-            await human_mouse_move(page)
-            ticks_since_mouse = 0
+        # Нерегулярное движение мыши — каждые 3-6 тиков вместо ровно каждые 4
+        ticks_until_mouse -= 1
+        if ticks_until_mouse <= 0:
+            await human_mouse_move(page, fast=True)
+            ticks_until_mouse = random.randint(3, 7)
 
 # ---------------------------------------------------------------------------
 # Точка входа
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
+    # Поднимаем стартовый VPN-туннель (первый конфиг из vpn_rotator.VPN_CONFIGS)
+    loop = asyncio.get_running_loop()
+    started = await loop.run_in_executor(None, vpn_rotator.rotate)
+    if started:
+        log.info("VPN стартовал на %s", started)
+        bot_state.on_vpn_rotated(started)
+    else:
+        log.warning("Не удалось поднять стартовый VPN — работаю на текущем соединении")
+
+    # Небольшая рандомизация viewport — у всех людей разные экраны
+    vp_w = random.choice([1280, 1366, 1440, 1536, 1920])
+    vp_h = random.choice([768, 800, 864, 900, 1080])
+
     async with async_playwright() as pw:
-        browser = await pw.firefox.launch(
+        browser = await pw.chromium.launch(
             headless=HEADLESS,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-infobars",
+                "--disable-extensions",
+                f"--window-size={vp_w},{vp_h}",
+            ],
         )
+        # Chrome UA соответствует реальному Chromium
+        chrome_ver = random.choice(["124.0.0.0", "125.0.0.0", "126.0.0.0"])
         context = await browser.new_context(
             user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
+                f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                f"AppleWebKit/537.36 (KHTML, like Gecko) "
+                f"Chrome/{chrome_ver} Safari/537.36"
             ),
             locale="ru-RU",
-            viewport={"width": 1280, "height": 800},
+            viewport={"width": vp_w, "height": vp_h},
         )
         page = await context.new_page()
         await stealth_async(page)
+        # Убираем маркеры автоматизации через CDP
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
+        """)
 
         # TG listener синхронный в отдельном потоке
         import threading
@@ -506,21 +751,12 @@ async def main() -> None:
 
         while True:
             try:
-                if not await login(page):
-                    log.error("Не смог войти, жду 60 сек")
-                    await tg(f"❌ Ошибка входа [{ts()}], повторяю через 60 сек")
-                    await asyncio.sleep(60)
-                    continue
-
-                if not await go_to_reschedule(page):
-                    await asyncio.sleep(30)
-                    continue
-
+                await open_target(page)
                 await monitor_loop(page)
 
             except RuntimeError as e:
                 if "session_expired" in str(e):
-                    log.info("Сессия истекла, перелогиниваемся")
+                    log.info("Сессия истекла, перезаход на TARGET_URL")
                     await asyncio.sleep(5)
                     continue
                 raise

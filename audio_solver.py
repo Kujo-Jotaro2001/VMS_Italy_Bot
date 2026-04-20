@@ -78,7 +78,7 @@ async def is_captcha_blocked(page) -> bool:
 
     # Попап на основной странице (именно его видно на скриншоте)
     try:
-        if await page.locator(BLOCK_RE).first.is_visible(timeout=1_500):
+        if await page.locator(BLOCK_RE).first.is_visible(timeout=600):
             return True
     except Exception:
         pass
@@ -86,7 +86,7 @@ async def is_captcha_blocked(page) -> bool:
     # Внутри bframe
     try:
         challenge = page.frame_locator('iframe[src*="bframe"]')
-        if await challenge.locator(BLOCK_RE).first.is_visible(timeout=1_500):
+        if await challenge.locator(BLOCK_RE).first.is_visible(timeout=600):
             return True
     except Exception:
         pass
@@ -115,19 +115,20 @@ async def solve_audio_challenge(page, _depth: int = 0) -> bool:
         audio_btn = challenge.locator("#recaptcha-audio-button")
         if await audio_btn.is_visible(timeout=3_000):
             print("  🎧 Переключаюсь на аудио-режим (после паузы)…", flush=True)
-            # "Посмотреть" на картинки перед переключением
-            await _human_delay(2.5, 5.0)
-            try:
-                await page.mouse.move(
-                    random.randint(200, 1080),
-                    random.randint(200, 600),
-                    steps=random.randint(6, 14),
-                )
-            except Exception:
-                pass
-            await _human_delay(0.8, 2.0)
+            # Пара движений мыши — «смотрим на картинку»
+            for _ in range(random.randint(1, 2)):
+                try:
+                    await page.mouse.move(
+                        random.randint(200, 1080),
+                        random.randint(200, 600),
+                        steps=random.randint(5, 10),
+                    )
+                except Exception:
+                    pass
+                await _human_delay(0.8, 1.8)
+            await _human_delay(0.5, 1.2)
             await _human_click(page, audio_btn)
-            await _human_delay(2.0, 3.5)
+            await _human_delay(1.2, 2.5)
     except Exception:
         pass  # Возможно уже в аудио-режиме
 
@@ -209,11 +210,16 @@ async def solve_audio_challenge(page, _depth: int = 0) -> bool:
         except Exception:
             # поле может быть вне viewport — форс-клик
             await input_field.click(timeout=5_000, force=True)
-        await _human_delay(0.3, 0.6)
-        # Вводим посимвольно как человек
+        # Человек «прослушал», теперь читает мысленно перед вводом
+        await _human_delay(0.8, 2.0)
+        # Вводим посимвольно — скорость неравномерная как у живого человека
         for ch in text:
             await input_field.press(ch)
-            await asyncio.sleep(random.uniform(0.05, 0.15))
+            # Иногда делаем паузу (задумался) — редко, но реалистично
+            if random.random() < 0.08:
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+            else:
+                await asyncio.sleep(random.uniform(0.08, 0.22))
         print("  ⌨️  Текст введён", flush=True)
     except Exception as e:
         print(f"  ❌ Не смог ввести текст: {e}", flush=True)

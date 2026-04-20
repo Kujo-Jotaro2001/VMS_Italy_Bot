@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(python -m pip install -r c:/Users/79097/VMS_Italy_Bot/requirements.txt)"
+    ]
+  }
+}

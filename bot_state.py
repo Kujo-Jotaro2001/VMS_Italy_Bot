@@ -13,6 +13,7 @@ _last_solved_at: Optional[datetime] = None
 _last_check_at: Optional[datetime] = None
 _last_slot_status: str = "неизвестно"
 _blocked_count: int = 0
+_current_vpn: str = "—"
 
 
 def on_captcha_solved(audio_text: str = "") -> None:
@@ -21,6 +22,15 @@ def on_captcha_solved(audio_text: str = "") -> None:
     if audio_text:
         _last_audio_text = audio_text
     _last_solved_at = datetime.now()
+
+
+def solved_count() -> int:
+    return _solved_count
+
+
+def on_vpn_rotated(name: str) -> None:
+    global _current_vpn
+    _current_vpn = name
 
 
 def on_blocked() -> None:
@@ -53,5 +63,6 @@ def status_text() -> str:
         f"🕒 Последняя капча: {fmt(_last_solved_at)}\n"
         f"🎙 Последний аудио-текст: <code>{_last_audio_text or '—'}</code>\n"
         f"🔍 Последняя проверка слотов: {fmt(_last_check_at)}\n"
-        f"📦 Слоты: {_last_slot_status}"
+        f"📦 Слоты: {_last_slot_status}\n"
+        f"🌍 VPN: {_current_vpn}"
     )
