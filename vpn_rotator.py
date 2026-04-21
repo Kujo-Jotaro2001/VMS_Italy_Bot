@@ -1,9 +1,9 @@
 """
-Ротация WireGuard-туннелей Red Shield VPN через CLI wireguard.exe.
+Ротация WireGuard-туннелей через CLI wg-quick (macOS).
 
 Требует:
-  * установленный WireGuard для Windows (wireguard.exe в PATH или по стандартному пути)
-  * запуск бота от администратора (install/uninstall service)
+  * установленный WireGuard: brew install wireguard-tools
+  * запуск с sudo или настроенный sudoers для wg-quick
   * .conf файлы в VPN_CONFIGS
 """
 
@@ -15,65 +15,78 @@ import time
 
 log = logging.getLogger(__name__)
 
+_DOWNLOADS = os.path.expanduser("~/Downloads")
+
 VPN_CONFIGS: list[str] = [
-    r"C:\Users\79097\Downloads\United_kingdom.conf",
-    r"C:\Users\79097\Downloads\Czech_republic.conf",
-    r"C:\Users\79097\Downloads\Serbia.conf",
+    os.path.join(_DOWNLOADS, "Belarus.conf"),
+    os.path.join(_DOWNLOADS, "Netherlands.conf"),
+    os.path.join(_DOWNLOADS, "Switzerland.conf"),
+    os.path.join(_DOWNLOADS, "Hungary.conf"),
+]
+
+# Timezone, соответствующий каждому конфигу (по индексу)
+VPN_TIMEZONES: list[str] = [
+    "Europe/Minsk",        # Serbia
+    "Europe/Amsterdam",         # Singapore
+    "Europe/Zurich",          # Switzerland
+    "Europe/Budapest",        # Hungary
 ]
 
 _current_idx: int = -1  # индекс активного конфига в VPN_CONFIGS
 
 
-def _wireguard_exe() -> str:
-    exe = shutil.which("wireguard.exe") or shutil.which("wireguard")
+def current_timezone() -> str:
+    """Возвращает timezone активного VPN-конфига."""
+    if _current_idx >= 0 and _current_idx < len(VPN_TIMEZONES):
+        return VPN_TIMEZONES[_current_idx]
+    return "Europe/Rome"  # fallback — целевой сайт итальянский
+
+
+def _wg_quick() -> str:
+    exe = shutil.which("wg-quick")
     if exe:
         return exe
-    for candidate in (
-        r"C:\Program Files\WireGuard\wireguard.exe",
-        r"C:\Program Files (x86)\WireGuard\wireguard.exe",
-    ):
-        if os.path.isfile(candidate):
-            return candidate
-    raise FileNotFoundError("wireguard.exe не найден — установи WireGuard для Windows")
+    raise FileNotFoundError("wg-quick не найден — установи WireGuard: brew install wireguard-tools")
 
 
 def _tunnel_name(conf_path: str) -> str:
     return os.path.splitext(os.path.basename(conf_path))[0]
 
 
-def _uninstall(tunnel_name: str) -> None:
-    exe = _wireguard_exe()
+def _uninstall(conf_path: str) -> None:
+    exe = _wg_quick()
+    tunnel_name = _tunnel_name(conf_path)
     try:
+        # Передаём полный путь к конфигу — wg-quick его принимает и для down
         r = subprocess.run(
-            [exe, "/uninstalltunnelservice", tunnel_name],
+            ["sudo", exe, "down", conf_path],
             capture_output=True, text=True, timeout=30,
         )
-        log.info("VPN uninstall %s: rc=%s %s", tunnel_name, r.returncode, (r.stderr or r.stdout).strip()[:200])
+        log.info("VPN down %s: rc=%s %s", tunnel_name, r.returncode, (r.stderr or r.stdout).strip()[:200])
     except Exception as e:
-        log.warning("VPN uninstall %s: %s", tunnel_name, e)
+        log.warning("VPN down %s: %s", tunnel_name, e)
 
 
 def _install(conf_path: str) -> bool:
-    exe = _wireguard_exe()
+    exe = _wg_quick()
     try:
         r = subprocess.run(
-            [exe, "/installtunnelservice", conf_path],
+            ["sudo", exe, "up", conf_path],
             capture_output=True, text=True, timeout=30,
         )
         ok = r.returncode == 0
-        log.info("VPN install %s: rc=%s %s", conf_path, r.returncode, (r.stderr or r.stdout).strip()[:200])
+        log.info("VPN up %s: rc=%s %s", conf_path, r.returncode, (r.stderr or r.stdout).strip()[:200])
         return ok
     except Exception as e:
-        log.warning("VPN install %s: %s", conf_path, e)
+        log.warning("VPN up %s: %s", conf_path, e)
         return False
 
 
 def _uninstall_all_known() -> None:
-    """Сносит все туннели из VPN_CONFIGS и ждёт пока Windows их реально уберёт."""
+    """Гасит все туннели из VPN_CONFIGS перед переключением."""
     for conf in VPN_CONFIGS:
-        _uninstall(_tunnel_name(conf))
-    # Ждём пока SCM (Service Control Manager) реально уберёт сервисы
-    time.sleep(3.0)
+        _uninstall(conf)
+    time.sleep(2.0)
 
 
 def rotate() -> str | None:
@@ -86,14 +99,12 @@ def rotate() -> str | None:
         log.warning("VPN_CONFIGS пуст — нечего ротировать")
         return None
 
-    # Сносим ВСЕ известные туннели — защита от залипших с прошлых запусков
     _uninstall_all_known()
 
     _current_idx = (_current_idx + 1) % len(VPN_CONFIGS)
     conf = VPN_CONFIGS[_current_idx]
     name = _tunnel_name(conf)
 
-    # Пробуем установить, с одной повторной попыткой если "already running"
     for attempt in range(2):
         if _install(conf):
             break
@@ -102,15 +113,14 @@ def rotate() -> str | None:
     else:
         return None
 
-    # WireGuard поднимает сервис пару секунд; даём сети перестроиться
     time.sleep(4.0)
     log.info("VPN переключён на %s", name)
     return name
 
 
 def shutdown() -> None:
-    """Сносит активный туннель при завершении бота."""
+    """Гасит активный туннель при завершении бота."""
     global _current_idx
     if _current_idx >= 0:
-        _uninstall(_tunnel_name(VPN_CONFIGS[_current_idx]))
+        _uninstall(VPN_CONFIGS[_current_idx])
         _current_idx = -1

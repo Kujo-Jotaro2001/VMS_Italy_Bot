@@ -514,6 +514,18 @@ async def solve_image_challenge(page) -> bool:
                 print(f"  ❌ не смог достать HTML: {e}", flush=True)
 
         log.info("Всего кликнуто тайлов: %d", clicked)
+
+        # Если ничего не кликнули — reload, а не пустой verify (пустой ответ = красный флаг)
+        if clicked == 0:
+            print("  ↩️  Ничего не кликнуто — жму reload для новых картинок", flush=True)
+            log.info("clicked=0 → reload")
+            reloaded = await _click_reload(challenge)
+            if not reloaded:
+                log.warning("Reload не найден — сдаюсь")
+                return False
+            await _human_delay(1.5, 2.5)
+            continue
+
         # Человеческая пауза после последнего клика — перед нажатием verify
         await _human_delay(0.8, 2.2)
 
