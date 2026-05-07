@@ -12,6 +12,7 @@ _last_audio_text: str = ""
 _last_solved_at: Optional[datetime] = None
 _last_check_at: Optional[datetime] = None
 _last_slot_status: str = "неизвестно"
+_last_http_preview: str = "—"
 _blocked_count: int = 0
 _current_vpn: str = "—"
 
@@ -38,10 +39,12 @@ def on_blocked() -> None:
     _blocked_count += 1
 
 
-def on_slot_check(has_slots: bool) -> None:
-    global _last_check_at, _last_slot_status
+def on_slot_check(has_slots: bool, http_preview: str = "") -> None:
+    global _last_check_at, _last_slot_status, _last_http_preview
     _last_check_at = datetime.now()
     _last_slot_status = "есть свободные" if has_slots else "нет"
+    if http_preview:
+        _last_http_preview = http_preview
 
 
 def status_text() -> str:
@@ -64,5 +67,6 @@ def status_text() -> str:
         f"🎙 Последний аудио-текст: <code>{_last_audio_text or '—'}</code>\n"
         f"🔍 Последняя проверка слотов: {fmt(_last_check_at)}\n"
         f"📦 Слоты: {_last_slot_status}\n"
+        f"📝 Ответ сервера: <code>{_last_http_preview}</code>\n"
         f"🌍 VPN: {_current_vpn}"
     )

@@ -111,8 +111,9 @@ import bot_state
 from audio_solver import solve_audio_challenge
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-    TARGET_URL, HEADLESS,
+    HEADLESS, VPN_ROTATION,
 )
+from config import TARGET_URL
 
 # Поддержка нескольких получателей: строка или список строк
 _CHAT_IDS: list[str] = (
@@ -255,26 +256,28 @@ async def image_challenge_present(page: Page) -> bool:
     except Exception:
         return False
 
-async def solve_captcha(page: Page, context: str = "") -> bool:
+async def solve_captcha(page: Page, context: str = "", fast: bool = False) -> bool:
     """
     1. Кликает чекбокс
     2. Если прошло — возвращает True
     3. Если появился bframe (любой challenge) — вызывает solve_audio_challenge
        (который сам переключится на аудио через #recaptcha-audio-button)
+    fast=True — минимальные паузы для срочного бронирования
     """
     label = f" ({context})" if context else ""
 
     try:
-        # Одно движение мыши — «заметил капчу»
-        await human_mouse_move(page)
-        await human_delay(0.5, 1.2)
+        if not fast:
+            await human_mouse_move(page)
+            await human_delay(0.5, 1.2)
         frame = page.frame_locator('iframe[title*="reCAPTCHA"]').first
         checkbox = frame.locator("#recaptcha-anchor")
         await checkbox.wait_for(state="visible", timeout=20_000)
-        await human_delay(0.4, 1.0)
+        if not fast:
+            await human_delay(0.4, 1.0)
         await human_click(page, checkbox)
         log.info("Кликнул капчу%s", label)
-        await asyncio.sleep(random.uniform(1.2, 2.5))
+        await asyncio.sleep(random.uniform(0.5, 0.8) if fast else random.uniform(1.2, 2.5))
     except Exception as e:
         log.warning("Не смог кликнуть капчу%s: %s", label, e)
         return False
@@ -313,21 +316,46 @@ async def solve_captcha(page: Page, context: str = "") -> bool:
 # Открытие целевой страницы
 # ---------------------------------------------------------------------------
 
-async def open_target(page: Page) -> None:
+async def open_target(page: Page, fast: bool = False) -> None:
     log.info("Открываю TARGET_URL…")
-    for attempt in range(5):
+    MAX_ATTEMPTS = 3
+    _dns_reset_done = False
+    for attempt in range(MAX_ATTEMPTS):
         try:
-            await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=45_000)
+            await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=20_000)
             break
         except Exception as e:
             err = str(e)
-            if attempt < 4 and any(x in err for x in ("ERR_NAME_NOT_RESOLVED", "ERR_NETWORK", "Timeout", "timeout")):
-                log.warning("Сайт недоступен (%s), жду 8с (попытка %d/5)…", err[:60], attempt + 1)
-                await asyncio.sleep(8.0)
+            dns_err = "ERR_NAME_NOT_RESOLVED" in err
+            net_err = dns_err or any(x in err for x in ("ERR_NETWORK", "Timeout", "timeout", "ERR_CONNECTION"))
+            if not net_err:
+                raise
+            log.warning("Сайт недоступен (%s), попытка %d/%d", err[:60], attempt + 1, MAX_ATTEMPTS)
+
+            if VPN_ROTATION:
+                from vpn_rotator import rotate_vpn_async, _reset_macos_network
+                # DNS не резолвится — сбрасываем сеть один раз за вызов open_target
+                if dns_err and not _dns_reset_done:
+                    log.warning("DNS не резолвится — сбрасываю сеть macOS")
+                    await asyncio.get_event_loop().run_in_executor(None, _reset_macos_network)
+                    _dns_reset_done = True
+                try:
+                    new_iface = await rotate_vpn_async()
+                    if new_iface:
+                        bot_state.on_vpn_rotated(new_iface)
+                        log.info("VPN переключён на %s", new_iface)
+                except Exception as ex:
+                    log.warning("Ротация VPN упала: %s", ex)
+
+            if attempt < MAX_ATTEMPTS - 1:
+                await asyncio.sleep(3.0)
             else:
                 raise
-    await human_delay(2.0, 4.0)
-    await human_mouse_move(page)
+    if fast:
+        await asyncio.sleep(0.3)
+    else:
+        await human_delay(2.0, 4.0)
+        await human_mouse_move(page)
 
 # ---------------------------------------------------------------------------
 # Проверка наличия слотов
@@ -569,65 +597,281 @@ async def click_next(page: Page) -> bool:
 # Основной цикл мониторинга (браузер открыт всё время)
 # ---------------------------------------------------------------------------
 
-CAPTCHA_INTERVAL_LO = 170     # сек между решениями капчи
-CAPTCHA_INTERVAL_HI = 190     # сек между решениями капчи
+CHECK_INTERVAL_LO = 60        # сек между GET-запросами (должен быть меньше TOKEN_TTL)
+CHECK_INTERVAL_HI = 90
+TOKEN_TTL = 110               # сек — через сколько принудительно обновляем recaptcha-токен (токен живёт ~120с, берём с запасом)
 CAPTCHA_FAIL_THRESHOLD = 3    # пересоздаём контекст после N неудач подряд
+
+
+def _extract_site_token(url: str) -> str:
+    """Достаёт параметр t=... из TARGET_URL (токен сессии для VMS)."""
+    from urllib.parse import urlparse, parse_qs
+    q = parse_qs(urlparse(url).query)
+    val = q.get("t", [""])[0]
+    return val
+
+
+async def _get_recaptcha_token(page: Page) -> str | None:
+    """Извлекает текущий g-recaptcha-response токен со страницы."""
+    try:
+        token = await page.evaluate("() => (typeof grecaptcha !== 'undefined') ? grecaptcha.getResponse() : ''")
+        if token and len(token) > 20:
+            return token
+        return None
+    except Exception as e:
+        log.warning("Не смог извлечь recaptcha-токен: %s", e)
+        return None
+
+
+async def _check_slots_http(
+    client: httpx.AsyncClient,
+    site_token: str,
+    recaptcha_token: str,
+    user_agent: str,
+) -> tuple[str, str]:
+    """
+    Делает GET к /vcs/get_nearest.htm с recaptcha-токеном.
+    Возвращает (status, body_preview):
+      status: "slot" | "no_slot" | "expired" | "rate_limit" | "error"
+    """
+    import re as _re
+    url = "https://italyvms.com/vcs/get_nearest.htm"
+    params = {
+        "center": "11",
+        "persons": "1",
+        "urgent": "0",
+        "token": site_token,
+        "g-recaptcha-response": recaptcha_token,
+        "lang": "ru",
+    }
+    headers = {
+        "User-Agent": user_agent,
+        "Referer": TARGET_URL,
+        "Accept-Language": "ru-RU,ru;q=0.9",
+    }
+    try:
+        r = await client.get(url, params=params, headers=headers)
+        body = r.text
+        import re as _re2
+        _plain = _re2.sub(r"<[^>]+>", "", body).strip()
+        _plain = _re2.sub(r"\s+", " ", _plain)
+        preview = _plain[:120]
+        print(f"[HTTP {ts()}] status={r.status_code} body={preview!r}", flush=True)
+        log.info("GET get_nearest: status=%s body=%r", r.status_code, preview)
+
+        if r.status_code != 200:
+            return ("expired", preview)
+        if "Пожалуйста, введите капчу" in body or "введите капчу" in body.lower():
+            return ("expired", preview)
+        if "Слишком много запросов" in body or "много запросов" in body.lower():
+            return ("rate_limit", preview)
+        if _re.search(r'\d{2}\.\d{2}\.\d{4}', body):
+            return ("slot", preview)
+        return ("no_slot", preview)
+    except Exception as e:
+        log.warning("HTTP GET упал: %s", e)
+        return ("error", str(e)[:100])
+
 
 async def monitor_loop(page: Page) -> None:
     """
-    Цикл: решаем капчу → сразу проверяем #first_date → ждём 2 мин → повтор.
+    Цикл:
+      1. Решаем капчу → получаем recaptcha-токен
+      2. Делаем GET к get_nearest.htm каждые 55-70с пока токен живой (до TOKEN_TTL)
+      3. Если токен протух — возвращаемся на страницу и решаем капчу заново
+      4. Если слот найден — открываем страницу, бронируем
     """
-    log.info("Мониторинг запущен (капча каждые %s–%sс)…", CAPTCHA_INTERVAL_LO, CAPTCHA_INTERVAL_HI)
+    log.info("Мониторинг запущен (GET каждые %s-%sс, TTL токена %sс)…",
+             CHECK_INTERVAL_LO, CHECK_INTERVAL_HI, TOKEN_TTL)
+
+    site_token = _extract_site_token(TARGET_URL)
+    if not site_token:
+        log.error("Не смог извлечь t= из TARGET_URL")
+        raise RuntimeError("bad_target_url")
+
+    # UA для HTTP-запросов — тот же что у браузера
+    user_agent = await page.evaluate("() => navigator.userAgent")
 
     captcha_fails = 0
+    google_blocks = 0  # подряд блокировок от Google "Повторите попытку позже"
+    rate_limits = 0    # подряд "Слишком много запросов" от italyvms.com
+    recaptcha_token: str | None = None
+    token_obtained_at: float = 0.0
+    first_captcha_solved = False  # до первой капчи GET не делаем
+
+    import time as _time
+    from audio_solver import is_captcha_blocked
 
     while True:
-        # Решаем капчу
-        if not await captcha_is_checked(page):
-            ok = await solve_captcha(page, "мониторинг")
-            if not ok:
+        status, preview = "no_slot", ""
+
+        # Нужно ли обновлять recaptcha-токен?
+        need_new_token = (
+            recaptcha_token is None
+            or (_time.time() - token_obtained_at) > TOKEN_TTL
+        )
+
+        if need_new_token:
+            # Возвращаемся на страницу если мы не там
+            if not page.url.startswith("http://italyvms.com/autoform"):
+                try:
+                    await open_target(page)
+                except Exception as e:
+                    log.warning("Не смог вернуться на TARGET_URL: %s", e)
+
+            if not await captcha_is_checked(page):
+                ok = await solve_captcha(page, "обновление токена")
+                if not ok:
+                    # Проверяем — это Google заблокировал ("Повторите попытку позже")?
+                    if await is_captcha_blocked(page):
+                        google_blocks += 1
+                        log.warning("Google показал блокировку (%d/3)", google_blocks)
+                        if google_blocks >= 3:
+                            log.warning("3 блокировки подряд — меняю VPN и пересоздаю browser context")
+                            await tg(f"⚠️ Google заблокировал капчу 3 раза [{ts()}] — меняю VPN и пересоздаю контекст")
+                            if VPN_ROTATION:
+                                from vpn_rotator import rotate_vpn_async
+                                new_iface = await rotate_vpn_async()
+                                if new_iface:
+                                    bot_state.on_vpn_rotated(new_iface)
+                                    log.info("VPN переключён на %s", new_iface)
+                            # Пересоздаём контекст — сбрасываем cookies/storage/fingerprint
+                            raise RuntimeError("captcha_failed")
+                        await asyncio.sleep(15.0)
+                        continue
+                    captcha_fails += 1
+                    log.warning("Капча не решилась (неудача %d/%d)", captcha_fails, CAPTCHA_FAIL_THRESHOLD)
+                    if captcha_fails >= CAPTCHA_FAIL_THRESHOLD:
+                        raise RuntimeError("captcha_failed")
+                    await asyncio.sleep(10.0)
+                    continue
+                captcha_fails = 0
+                google_blocks = 0
+                await asyncio.sleep(random.uniform(2.0, 3.0))
+
+            recaptcha_token = await _get_recaptcha_token(page)
+            if not recaptcha_token:
+                log.warning("Капча решена, но токен не получен — повторяю")
                 captcha_fails += 1
-                log.warning("Капча не решилась (неудача %d/%d)", captcha_fails, CAPTCHA_FAIL_THRESHOLD)
                 if captcha_fails >= CAPTCHA_FAIL_THRESHOLD:
                     raise RuntimeError("captcha_failed")
-                await asyncio.sleep(10.0)
+                await asyncio.sleep(5.0)
                 continue
-            captcha_fails = 0
-            await asyncio.sleep(random.uniform(2.0, 3.0))
+            token_obtained_at = _time.time()
+            first_captcha_solved = True
+            log.info("Получен свежий recaptcha-токен (длина %d)", len(recaptcha_token))
 
-        # Сразу после капчи читаем #first_date
-        has_slots = await slots_available(page)
-        bot_state.on_slot_check(has_slots)
+            # Читаем результат прямо со страницы — данные уже в DOM после капчи
+            if await slots_available(page):
+                log.info("Слот найден прямо на странице после решения капчи!")
+                bot_state.on_slot_check(True, await page.evaluate(
+                    "() => { const el = document.querySelector('#first_date'); "
+                    "return el ? (el.innerText || el.textContent || '').trim() : ''; }"
+                ))
+                status, preview = "slot", ""
+            else:
+                log.info("Слотов на странице нет — переходим к периодическим GET-запросам")
+                bot_state.on_slot_check(False)
+                await asyncio.sleep(random.uniform(CHECK_INTERVAL_LO, CHECK_INTERVAL_HI))
+                continue
 
-        if not has_slots:
-            log.info("Слотов нет — жду %s–%sс до следующей капчи…", CAPTCHA_INTERVAL_LO, CAPTCHA_INTERVAL_HI)
-            await asyncio.sleep(random.uniform(CAPTCHA_INTERVAL_LO, CAPTCHA_INTERVAL_HI))
+        # GET-запрос только после того как первая капча решена
+        if not first_captcha_solved:
+            await asyncio.sleep(1.0)
             continue
 
-        # Слот найден — бронируем
-        msg = f"🎉 НАЙДЕН СВОБОДНЫЙ СЛОТ! [{ts()}]\n{page.url}"
-        log.info(msg)
-        await tg(msg)
-
-        pressed = False
-        try:
-            pressed = await click_next(page)
-        except Exception as e:
-            log.exception("Ошибка при бронировании: %s", e)
-
-        if pressed:
-            await tg(
-                f"✅ Выбрал дату/время и нажал «Далее» [{ts()}] "
-                f"— заходи на сайт СРОЧНО и заверши запись!\n{page.url}"
-            )
-        else:
-            await tg(
-                f"⚠️ Не смог нажать «Далее» автоматически [{ts()}] "
-                f"— зайди вручную немедленно!\n{page.url}"
+        if status != "slot":
+            age = _time.time() - token_obtained_at
+            print(f"[HTTP {ts()}] отправляю запрос, токен возраст={age:.0f}с (свежий={'да' if age<10 else 'нет'})", flush=True)
+            status, preview = await _check_slots_http(
+                client=_HTTPX_CLIENT,
+                site_token=site_token,
+                recaptcha_token=recaptcha_token,
+                user_agent=user_agent,
             )
 
-        log.info("Слот обработан — пауза 120с")
-        await asyncio.sleep(120)
+        if status == "slot":
+            bot_state.on_slot_check(True, preview)
+            msg = f"🎉 НАЙДЕН СВОБОДНЫЙ СЛОТ! [{ts()}]\n{TARGET_URL}"
+            log.info(msg)
+            await tg(msg)
+
+            # Перезагружаем страницу и немедленно решаем капчу — токен живёт ~60с
+            try:
+                await open_target(page, fast=True)
+                ok = await solve_captcha(page, "бронирование", fast=True)
+                if not ok:
+                    await tg(f"⚠️ Слот найден, но капча не решилась [{ts()}] — зайди вручную!\n{TARGET_URL}")
+                    await asyncio.sleep(120)
+                    continue
+
+                pressed = False
+                try:
+                    pressed = await click_next(page)
+                except Exception as e:
+                    log.exception("Ошибка при бронировании: %s", e)
+
+                if pressed:
+                    await tg(
+                        f"✅ Выбрал дату/время и нажал «Далее» [{ts()}] "
+                        f"— заходи на сайт СРОЧНО и заверши запись!\n{page.url}"
+                    )
+                else:
+                    await tg(
+                        f"⚠️ Не смог нажать «Далее» автоматически [{ts()}] "
+                        f"— зайди вручную немедленно!\n{page.url}"
+                    )
+            except Exception as e:
+                log.exception("Ошибка в бронировании: %s", e)
+
+            # Токен после бронирования уже использован — сбросим
+            recaptcha_token = None
+            log.info("Слот обработан — пауза 120с")
+            await asyncio.sleep(120)
+            continue
+
+        if status == "expired":
+            log.info("Токен протух — сразу идём решать капчу (без паузы)")
+            recaptcha_token = None
+            bot_state.on_slot_check(False, preview)
+            # Короткая пауза чтобы не долбить сервер, но не полный интервал
+            await asyncio.sleep(random.uniform(3.0, 6.0))
+            continue
+
+        if status == "rate_limit":
+            rate_limits += 1
+            log.info("Rate-limit от сервера (%d/2)", rate_limits)
+            bot_state.on_slot_check(False, preview)
+            if rate_limits >= 2:
+                log.warning("2 rate-limit подряд — меняю VPN")
+                await tg(f"⚠️ Слишком много запросов 2 раза подряд [{ts()}] — меняю VPN")
+                if VPN_ROTATION:
+                    from vpn_rotator import rotate_vpn_async
+                    new_iface = await rotate_vpn_async()
+                    if new_iface:
+                        bot_state.on_vpn_rotated(new_iface)
+                        log.info("VPN переключён на %s", new_iface)
+                rate_limits = 0
+                recaptcha_token = None  # после смены IP старый токен может быть невалиден
+                await asyncio.sleep(5.0)
+                continue
+            await tg(f"⚠️ Слишком много запросов [{ts()}] — жду следующего интервала")
+            await asyncio.sleep(random.uniform(CHECK_INTERVAL_LO, CHECK_INTERVAL_HI))
+            continue
+
+        if status == "error":
+            bot_state.on_slot_check(False, preview)
+            await asyncio.sleep(random.uniform(CHECK_INTERVAL_LO, CHECK_INTERVAL_HI))
+            continue
+
+        # no_slot
+        rate_limits = 0  # успешный ответ — сбрасываем счётчик rate_limit
+        bot_state.on_slot_check(False, preview)
+        await asyncio.sleep(random.uniform(CHECK_INTERVAL_LO, CHECK_INTERVAL_HI))
+
+
+# Глобальный httpx клиент для GET-запросов (переиспользует соединение)
+_HTTPX_CLIENT: httpx.AsyncClient = None  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -635,8 +879,46 @@ async def monitor_loop(page: Page) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
+    global _HTTPX_CLIENT
+    _HTTPX_CLIENT = httpx.AsyncClient(timeout=20, verify=False, follow_redirects=True)
+
     import threading
     threading.Thread(target=telegram_command_listener_sync, daemon=True).start()
+
+    if VPN_ROTATION:
+        from vpn_rotator import rotate_vpn_async, teardown_vpn, last_rotation_at
+        import atexit
+        atexit.register(teardown_vpn)
+
+        async def _on_vpn_rotate(iface: str) -> None:
+            bot_state.on_vpn_rotated(iface)
+            log.info("VPN сменён на %s", iface)
+
+        # Первое подключение ДО запуска браузера — ждём пока VPN реально поднимется
+        log.info("VPN: подключаюсь перед запуском браузера…")
+        first_iface = await rotate_vpn_async()
+        if first_iface:
+            await _on_vpn_rotate(first_iface)
+        else:
+            log.warning("VPN: первое подключение не удалось — браузер запустится без VPN")
+
+        # Плановая ротация: ждём пока с момента ПОСЛЕДНЕЙ ротации (любой — плановой
+        # или экстренной из monitor_loop) пройдёт VPN_ROTATE_INTERVAL секунд.
+        # Так экстренная ротация по google_blocks сдвигает плановый таймер.
+        async def _rotation_loop(on_rotate=None) -> None:
+            import time as _t
+            from vpn_rotator import VPN_ROTATE_INTERVAL
+            while True:
+                wait = max(1.0, last_rotation_at() + VPN_ROTATE_INTERVAL - _t.time())
+                await asyncio.sleep(wait)
+                # Если за время сна была экстренная ротация — таймер ушёл вперёд, спим ещё
+                if _t.time() < last_rotation_at() + VPN_ROTATE_INTERVAL:
+                    continue
+                iface = await rotate_vpn_async()
+                if iface and on_rotate:
+                    await on_rotate(iface)
+
+        asyncio.create_task(_rotation_loop(on_rotate=_on_vpn_rotate))
 
     vp_w = random.choice([1280, 1366, 1440, 1536, 1920])
     vp_h = random.choice([768, 800, 864, 900, 1080])
@@ -702,4 +984,11 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if VPN_ROTATION:
+            from vpn_rotator import teardown_vpn
+            teardown_vpn()
